@@ -13,7 +13,8 @@ def add_chunks(chunks, embeddings):
     metadatas = []
 
     for i, chunk in enumerate(chunks):
-        ids.append(str(i))
+        unique_id = f"{chunk['file']}::{chunk['start_line']}-{chunk['end_line']}"
+        ids.append(unique_id)
         documents.append(chunk["text"])
         metadatas.append({
             "file": chunk["file"],

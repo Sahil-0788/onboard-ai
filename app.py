@@ -65,6 +65,10 @@ CODE SNIPPETS:
 
 QUESTION: {question}
 """
-            response = ollama.generate(model="phi3", prompt=prompt)
+            response = ollama.generate(
+    model="phi3",
+    prompt=prompt,
+    options={"num_predict": 200}
+)
 
         st.markdown(response["response"].strip())

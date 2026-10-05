@@ -9,6 +9,16 @@ import os
 st.set_page_config(page_title="Codebase Q&A", page_icon="💬")
 st.title("Ask your codebase")
 
+with st.expander("Advanced"):
+    if st.button("Reset database (clears everything indexed so far)"):
+        import shutil
+        try:
+            shutil.rmtree("./chroma_db", ignore_errors=True)
+            st.session_state.indexed = False
+            st.success("Database cleared. You can index a codebase again now.")
+        except Exception as e:
+            st.error(f"Couldn't reset: {e}")
+
 if "indexed" not in st.session_state:
     st.session_state.indexed = False
 
@@ -27,7 +37,7 @@ if not check_ollama_running():
         "Can't connect to Ollama. Make sure Ollama is running "
         "(open a terminal and run `ollama serve`), then refresh this page."
     )
-    st.stop()  # halts the app here, nothing below runs
+    st.stop()
 
 folder = st.text_input("Codebase folder path").strip().strip('"')
 
@@ -53,12 +63,29 @@ if st.button("Index this codebase"):
                         st.warning("Files were found, but no readable content was extracted from them.")
                     else:
                         all_embeddings = []
-                        for chunk in all_chunks:
-                            all_embeddings.append(get_embedding(chunk["text"]))
+                        valid_chunks = []
+                        skipped_count = 0
 
-                        add_chunks(all_chunks, all_embeddings)
-                        st.session_state.indexed = True
-                        st.success(f"Indexed {len(all_chunks)} chunks from {len(files)} files.")
+                        for chunk in all_chunks:
+                            try:
+                                embedding = get_embedding(chunk["text"])
+                                all_embeddings.append(embedding)
+                                valid_chunks.append(chunk)
+                            except Exception:
+                                skipped_count += 1
+
+                        all_chunks = valid_chunks
+
+                        if not all_chunks:
+                            st.error("No chunks could be processed. The files may be too large or unusual to embed.")
+                        else:
+                            add_chunks(all_chunks, all_embeddings)
+                            st.session_state.indexed = True
+
+                            msg = f"Indexed {len(all_chunks)} chunks from {len(files)} files."
+                            if skipped_count > 0:
+                                msg += f" ({skipped_count} oversized/problematic chunks were skipped.)"
+                            st.success(msg)
         except Exception as e:
             st.error(f"Something went wrong while indexing: {e}")
 
@@ -81,7 +108,7 @@ if st.session_state.indexed:
                         context_pieces.append(
                             f"File: {meta['file']} (lines {meta['start_line']}-{meta['end_line']})\n{text}"
                         )
-                        context = "\n\n---\n\n".join(context_pieces)
+                    context = "\n\n---\n\n".join(context_pieces)
 
                     wants_example = any(
                         keyword in question.lower()

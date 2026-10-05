@@ -37,24 +37,28 @@ def find_code_files(root_folder):
 
 def chunk_file(file_path):
     """
-    Reads one file and splits its contents into chunks of CHUNK_SIZE lines each.
-    Returns a list of chunk dictionaries with useful info attached.
+    Reads one file and splits its contents into chunks of CHUNK_SIZE lines each,
+    while also enforcing a maximum character limit per chunk so we never send
+    an oversized chunk to the embedding model (e.g. minified files, very long lines).
     """
+    MAX_CHARS_PER_CHUNK = 4000  # safety cap, regardless of line count
+
     chunks = []
 
-    # encoding="utf-8", errors="ignore" avoids crashing on weird/foreign characters
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         lines = f.readlines()
 
-    # Walk through the lines, CHUNK_SIZE at a time
-    for i in range(0, len(lines), CHUNK_SIZE):
+    i = 0
+    while i < len(lines):
         chunk_lines = lines[i : i + CHUNK_SIZE]
         chunk_text = "".join(chunk_lines)
 
-        if chunk_text.strip():  # skip empty chunks (blank sections of a file)
+        # If even this chunk is too big (long lines), trim it down further
+        if len(chunk_text) > MAX_CHARS_PER_CHUNK:
+            chunk_text = chunk_text[:MAX_CHARS_PER_CHUNK]
+
+        if chunk_text.strip():
             filename_only = os.path.basename(file_path)
-            # Prepend the filename into the text itself, so the embedding
-            # "knows" which file this chunk belongs to, not just the raw code.
             text_with_context = f"# File: {filename_only}\n{chunk_text}"
 
             chunks.append({
@@ -63,6 +67,8 @@ def chunk_file(file_path):
                 "end_line": i + len(chunk_lines),
                 "text": text_with_context,
             })
+
+        i += CHUNK_SIZE
 
     return chunks
 

@@ -1,4 +1,5 @@
 import chromadb
+import os
 
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection(name="codebase")
@@ -46,13 +47,38 @@ def clear_folder(folder_path):
         collection.delete(ids=ids_to_delete)
 
 
-def search(query_embedding, top_k=3):
+def search(query_embedding, top_k=3, folder=None):
+    if folder:
+        raw = collection.query(query_embeddings=[query_embedding], n_results=top_k * 5)
+        filtered_docs, filtered_metas = [], []
+        for doc, meta in zip(raw["documents"][0], raw["metadatas"][0]):
+            if meta["file"].startswith(folder):
+                filtered_docs.append(doc)
+                filtered_metas.append(meta)
+            if len(filtered_docs) >= top_k:
+                break
+        return {"documents": [filtered_docs], "metadatas": [filtered_metas]}
+    else:
+        return collection.query(query_embeddings=[query_embedding], n_results=top_k)
+
+def list_indexed_files():
+    """Returns the set of all file paths currently stored in the database."""
+    try:
+        existing = collection.get()
+        return set(m["file"] for m in existing["metadatas"])
+    except Exception:
+        return set()
+
+def list_indexed_folders():
     """
-    Given an embedding (e.g. of a question), finds the top_k
-    most similar chunks stored in the database.
+    Returns the set of distinct top-level folders currently indexed,
+    derived from the stored file paths.
     """
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-    )
-    return results
+    files = list_indexed_files()
+    folders = set()
+    for f in files:
+        # Walk up from the file to find a reasonable "project folder" guess:
+        # take everything except the filename itself.
+        folder = os.path.dirname(f)
+        folders.add(folder)
+    return folders

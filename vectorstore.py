@@ -1,19 +1,19 @@
-import chromadb
 import os
+import chromadb
 
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_or_create_collection(name="codebase")
 
 
-def add_chunks(chunks, embeddings):
-    """
-    Saves a batch of chunks into ChromaDB, along with their embeddings.
-    """
-    ids = []
-    documents = []
-    metadatas = []
+def in_folder(file_path, folder):
+    """True if file_path is the folder itself or sits inside it (not just a name prefix)."""
+    folder = folder.rstrip("\\/")
+    return file_path == folder or file_path.startswith(folder + os.sep)
 
-    for i, chunk in enumerate(chunks):
+
+def add_chunks(chunks, embeddings):
+    ids, documents, metadatas = [], [], []
+    for chunk in chunks:
         unique_id = f"{chunk['file']}::{chunk['start_line']}-{chunk['end_line']}"
         ids.append(unique_id)
         documents.append(chunk["text"])
@@ -22,29 +22,35 @@ def add_chunks(chunks, embeddings):
             "start_line": chunk["start_line"],
             "end_line": chunk["end_line"],
         })
-
-    collection.add(
-        ids=ids,
-        embeddings=embeddings,
-        documents=documents,
-        metadatas=metadatas,
-    )
+    collection.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
 
 
 def clear_folder(folder_path):
-    """
-    Deletes all previously stored chunks that came from this specific folder,
-    so re-indexing the same folder doesn't create duplicates.
-    """
     existing = collection.get()
-
     ids_to_delete = []
     for i, metadata in enumerate(existing["metadatas"]):
-        if metadata["file"].startswith(folder_path):
+        if in_folder(metadata["file"], folder_path):
             ids_to_delete.append(existing["ids"][i])
-
     if ids_to_delete:
         collection.delete(ids=ids_to_delete)
+
+
+def list_indexed_files():
+    try:
+        existing = collection.get()
+        return set(m["file"] for m in existing["metadatas"])
+    except Exception:
+        return set()
+
+
+def get_file_chunks(file_path, limit=3):
+    """Returns (documents, metadatas) for the first `limit` chunks of one file, in line order."""
+    try:
+        res = collection.get(where={"file": file_path})
+    except Exception:
+        return [], []
+    pairs = sorted(zip(res["metadatas"], res["documents"]), key=lambda p: p[0]["start_line"])[:limit]
+    return [p[1] for p in pairs], [p[0] for p in pairs]
 
 
 def search(query_embedding, top_k=3, folder=None):
@@ -52,33 +58,10 @@ def search(query_embedding, top_k=3, folder=None):
         raw = collection.query(query_embeddings=[query_embedding], n_results=top_k * 5)
         filtered_docs, filtered_metas = [], []
         for doc, meta in zip(raw["documents"][0], raw["metadatas"][0]):
-            if meta["file"].startswith(folder):
+            if in_folder(meta["file"], folder):
                 filtered_docs.append(doc)
                 filtered_metas.append(meta)
             if len(filtered_docs) >= top_k:
                 break
         return {"documents": [filtered_docs], "metadatas": [filtered_metas]}
-    else:
-        return collection.query(query_embeddings=[query_embedding], n_results=top_k)
-
-def list_indexed_files():
-    """Returns the set of all file paths currently stored in the database."""
-    try:
-        existing = collection.get()
-        return set(m["file"] for m in existing["metadatas"])
-    except Exception:
-        return set()
-
-def list_indexed_folders():
-    """
-    Returns the set of distinct top-level folders currently indexed,
-    derived from the stored file paths.
-    """
-    files = list_indexed_files()
-    folders = set()
-    for f in files:
-        # Walk up from the file to find a reasonable "project folder" guess:
-        # take everything except the filename itself.
-        folder = os.path.dirname(f)
-        folders.add(folder)
-    return folders
+    return collection.query(query_embeddings=[query_embedding], n_results=top_k)

@@ -32,16 +32,18 @@ def create_session(folder):
     return session_id
 
 
-def add_message(session_id, question, answer):
+def add_message(session_id, question, answer, focus=None):
+    """focus = full paths of the file(s) this exchange was about, so follow-ups can reuse them."""
     sessions = load_sessions()
     if session_id in sessions:
-        sessions[session_id]["messages"].append({"question": question, "answer": answer})
+        sessions[session_id]["messages"].append(
+            {"question": question, "answer": answer, "focus": focus or []}
+        )
         save_sessions(sessions)
 
 
 def get_session(session_id):
-    sessions = load_sessions()
-    return sessions.get(session_id)
+    return load_sessions().get(session_id)
 
 
 def list_sessions():

@@ -15,8 +15,13 @@ REFERENCE_WORDS = {"that", "it", "those", "these", "them", "they", "above", "ear
 # Words that suggest a broad search question instead ("which file handles ...").
 SEARCH_WORDS = {"file", "files", "folder", "project", "codebase", "which", "where", "any"}
 
+# File types where "//" starts a comment.
+C_STYLE_EXTENSIONS = {".c", ".cpp", ".java", ".js", ".ts"}
+
 MAX_CONTEXT_CHARS = 6500          # keeps the prompt inside phi3's 4096-token window
 MAX_HISTORY_ANSWER_CHARS = 500
+MAX_SENTENCES = 4                 # hard cap on answer length (phi3 ignores the prompt rule)
+MAX_SENTENCES_EXAMPLE = 6
 
 
 class CoreError(Exception):
@@ -150,6 +155,36 @@ def _mentioned_files(question, files):
     return found[:3]
 
 
+def _strip_commented_code(text):
+    """Remove '//' comments that look like disabled code (they end in ; { or }),
+    so the model doesn't mistake them for real code. Prose comments are kept."""
+    out = []
+    for line in text.split("\n"):
+        m = re.search(r"(?<!:)//(.*)$", line)
+        # Skip matches inside a string: an odd number of quotes before the '//' means we're in one.
+        if m and line[: m.start()].count('"') % 2 == 0 and m.group(1).rstrip().endswith((";", "{", "}")):
+            line = line[: m.start()].rstrip()
+            if not line.strip():
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _cut_leaked_tail(answer):
+    """phi3 sometimes adds a made-up ALL-CAPS heading or 'Certainly!' after the real answer."""
+    pattern = r"\n\s*\n(?=\s*(?:Certainly\b|[A-Z][A-Z0-9 ,.'\-?:]{15,}))"
+    return re.split(pattern, answer)[0].strip()
+
+
+def _limit_sentences(text, max_sentences):
+    """Keep only the first few sentences. A split needs whitespace after the punctuation,
+    so file names like pattern3.cpp are not broken apart."""
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    if len(sentences) <= max_sentences:
+        return text
+    return " ".join(sentences[:max_sentences]).strip()
+
+
 def _trim_to_sentence(text):
     """If the answer was cut off by the token limit, drop the unfinished last sentence."""
     if not text or text[-1] in ".!?":
@@ -213,7 +248,11 @@ def answer_question(session_id, question):
 
     pieces, used_metas, total = [], [], 0
     for meta, text in zip(metas, docs):
-        piece = f"File: {meta['file']} (lines {meta['start_line']}-{meta['end_line']})\n{text}"
+        if os.path.splitext(meta["file"])[1].lower() in C_STYLE_EXTENSIONS:
+            text = _strip_commented_code(text)
+        # Show a short path relative to the indexed folder, not the full C:\Users\... path.
+        shown_name = os.path.relpath(meta["file"], folder)
+        piece = f"File: {shown_name} (lines {meta['start_line']}-{meta['end_line']})\n{text}"
         if pieces and total + len(piece) > MAX_CONTEXT_CHARS:
             break
         pieces.append(piece[:MAX_CONTEXT_CHARS])
@@ -254,6 +293,7 @@ def answer_question(session_id, question):
 Use ONLY the code snippets below to answer the question.
 If the answer isn't in the snippets, say so honestly. Do not guess about code that is not shown.
 Mention the specific file name(s) naturally in your answer, as part of the sentence.
+Refer to a file by the short name shown after "File:", never by a full drive path.
 If the question refers back to something discussed earlier ("that", "it", "the one you mentioned"),
 use the recent conversation below to understand what it refers to.
 {focus_line}
@@ -277,10 +317,12 @@ QUESTION: {effective_question}
     )
     answer = response["response"].strip()
     answer = re.split(r"\n\s*QUESTION:", answer)[0].strip()   # safety net if the model leaks it anyway
+    answer = _cut_leaked_tail(answer)
     if not wants_example:
         answer = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     answer = re.sub(r"\n{3,}", "\n\n", answer)
     answer = _trim_to_sentence(answer)
+    answer = _limit_sentences(answer, MAX_SENTENCES_EXAMPLE if wants_example else MAX_SENTENCES)
 
     sessions.add_message(session_id, question, answer, focus=focus)
     return {

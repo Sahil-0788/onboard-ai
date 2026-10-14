@@ -78,7 +78,7 @@ def index_folder(folder):
 
     # Only now remove the old data for this folder, so a failed run never wipes a working index.
     clear_folder(folder)
-    add_chunks(valid_chunks, embeddings)
+    add_chunks(valid_chunks, embeddings, folder)
     session_id = sessions.create_session(folder)
 
     return {
@@ -98,12 +98,15 @@ def start_session(folder):
 
 
 def _folder_files(folder):
-    return sorted(p for p in list_indexed_files() if in_folder(p, folder))
+    return sorted(list_indexed_files(folder))
 
 
 def _candidates(folder, files):
-    """Names a user might type: file names (with and without extension) and the folder's own name."""
-    names = {os.path.basename(folder).lower()}
+    """Names a user might type: file names (with and without extension) and the folder's own name.
+    The folder name is split into single words ("C Programs" -> "c", "programs"), because a
+    name containing a space can never match one typed word and caused bad corrections."""
+    names = set(re.split(r"[\s_\-]+", os.path.basename(folder).lower()))
+    names.discard("")
     for path in files:
         rel = os.path.relpath(path, folder)
         for part in rel.replace("\\", "/").split("/"):
@@ -211,6 +214,8 @@ def answer_question(session_id, question, model=None):
     history = session["messages"]
 
     files = _folder_files(folder)
+    if not files:
+        raise CoreError("This folder needs to be indexed again before you can ask about it.")
     candidates = _candidates(folder, files)
     effective_question, corrected = _correct_typos(question, candidates)
 
@@ -322,6 +327,7 @@ QUESTION: {effective_question}
     answer = response["response"].strip()
     answer = re.split(r"\n\s*QUESTION:", answer)[0].strip()   # safety net if the model leaks it anyway
     answer = _cut_leaked_tail(answer)
+    answer = re.sub(r"^File:\s*", "", answer)                 # drop a stray "File:" copied from the prompt
     if not wants_example:
         answer = re.sub(r"```.*?```", "", answer, flags=re.DOTALL).strip()
     answer = re.sub(r"\n{3,}", "\n\n", answer)

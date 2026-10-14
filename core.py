@@ -10,6 +10,9 @@ from chunker import find_code_files, chunk_file
 from embedder import get_embedding
 from vectorstore import add_chunks, search, clear_folder, list_indexed_files, in_folder, get_file_chunks
 
+# The model that writes answers. Change this one line to switch models.
+ANSWER_MODEL = "qwen2.5-coder:3b"
+
 # Words that suggest a question refers back to the previous answer ("what is X used for in that").
 REFERENCE_WORDS = {"that", "it", "those", "these", "them", "they", "above", "earlier", "previous"}
 # Words that suggest a broad search question instead ("which file handles ...").
@@ -18,9 +21,9 @@ SEARCH_WORDS = {"file", "files", "folder", "project", "codebase", "which", "wher
 # File types where "//" starts a comment.
 C_STYLE_EXTENSIONS = {".c", ".cpp", ".java", ".js", ".ts"}
 
-MAX_CONTEXT_CHARS = 6500          # keeps the prompt inside phi3's 4096-token window
+MAX_CONTEXT_CHARS = 6500          # keeps the prompt inside a 4096-token window
 MAX_HISTORY_ANSWER_CHARS = 500
-MAX_SENTENCES = 4                 # hard cap on answer length (phi3 ignores the prompt rule)
+MAX_SENTENCES = 4                 # hard cap on answer length (small models ignore the prompt rule)
 MAX_SENTENCES_EXAMPLE = 6
 
 
@@ -33,10 +36,10 @@ def ollama_status():
         resp = ollama.list()
         names = [(m.model or "") for m in resp.models]
     except Exception:
-        return {"ollama_running": False, "phi3": False, "embedding_model": False}
+        return {"ollama_running": False, "answer_model": False, "embedding_model": False}
     return {
         "ollama_running": True,
-        "phi3": any(n.startswith("phi3") for n in names),
+        "answer_model": any(n.startswith(ANSWER_MODEL) for n in names),
         "embedding_model": any(n.startswith("nomic-embed-text") for n in names),
     }
 
@@ -171,7 +174,7 @@ def _strip_commented_code(text):
 
 
 def _cut_leaked_tail(answer):
-    """phi3 sometimes adds a made-up ALL-CAPS heading or 'Certainly!' after the real answer."""
+    """Small models sometimes add a made-up ALL-CAPS heading or 'Certainly!' after the real answer."""
     pattern = r"\n\s*\n(?=\s*(?:Certainly\b|[A-Z][A-Z0-9 ,.'\-?:]{15,}))"
     return re.split(pattern, answer)[0].strip()
 
@@ -195,7 +198,8 @@ def _trim_to_sentence(text):
     return text
 
 
-def answer_question(session_id, question):
+def answer_question(session_id, question, model=None):
+    model = model or ANSWER_MODEL
     question = question.strip()
     if not question:
         raise CoreError("Please type a question first.")
@@ -311,7 +315,7 @@ QUESTION: {effective_question}
 """
 
     response = ollama.generate(
-        model="phi3",
+        model=model,
         prompt=prompt,
         options={"num_predict": 200, "stop": ["QUESTION:", "CODE SNIPPETS:", "RECENT CONVERSATION"]},
     )

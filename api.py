@@ -69,13 +69,25 @@ def new_session(req: FolderRequest):
 
 @app.post("/index")
 def index(req: FolderRequest):
+    """Starts indexing in the background and returns a job_id. Poll GET /index/{job_id}."""
     _require_ollama()
     try:
-        return core.index_folder(req.folder)
+        return core.start_index_job(req.folder)
     except core.CoreError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Something went wrong while indexing: {e}")
+
+
+@app.get("/index/{job_id}")
+def index_status(job_id: str):
+    job = core.get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown indexing job. It may have finished long ago or the server was restarted.",
+        )
+    return job
 
 
 @app.post("/sessions/{session_id}/ask")

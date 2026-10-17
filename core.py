@@ -1,13 +1,16 @@
 import os
 import re
+import time
+import uuid
 import difflib
 import shutil
+import threading
 import ollama
 
 import sessions
 import vectorstore
 from chunker import find_code_files, chunk_file
-from embedder import get_embedding
+from embedder import get_embedding, get_embeddings
 from vectorstore import add_chunks, search, clear_folder, list_indexed_files, in_folder, get_file_chunks
 
 # The model that writes answers. Change this one line to switch models.
@@ -25,6 +28,13 @@ MAX_CONTEXT_CHARS = 6500          # keeps the prompt inside a 4096-token window
 MAX_HISTORY_ANSWER_CHARS = 500
 MAX_SENTENCES = 4                 # hard cap on answer length (small models ignore the prompt rule)
 MAX_SENTENCES_EXAMPLE = 6
+
+EMBED_BATCH_SIZE = 16             # chunks embedded per Ollama call while indexing
+MAX_JOBS_KEPT = 50
+
+# Indexing jobs live in memory only: they are forgotten when the server restarts.
+_JOBS = {}
+_JOBS_LOCK = threading.Lock()
 
 
 class CoreError(Exception):
@@ -48,7 +58,95 @@ def ollama_running():
     return ollama_status()["ollama_running"]
 
 
-def index_folder(folder):
+# ---------------------------------------------------------------- indexing jobs
+
+def _update_job(job_id, **fields):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job:
+            job.update(fields)
+
+
+def _finish_job(job_id, **fields):
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if job:
+            job["seconds"] = round(time.time() - job["started"], 1)
+            job.update(fields)
+
+
+def _trim_jobs():
+    """Called while holding the lock. Forget the oldest finished jobs."""
+    if len(_JOBS) <= MAX_JOBS_KEPT:
+        return
+    finished = [jid for jid, j in _JOBS.items() if j["status"] != "running"]
+    for jid in finished[: len(_JOBS) - MAX_JOBS_KEPT]:
+        del _JOBS[jid]
+
+
+def _embed_batch(batch):
+    """Embeds a batch of chunks. If the batch call fails, retries one by one so a single
+    bad chunk only skips itself. Returns a list the same length as batch (None = failed)."""
+    try:
+        vectors = get_embeddings([c["text"] for c in batch])
+        if len(vectors) == len(batch):
+            return vectors
+    except Exception:
+        pass
+    out = []
+    for chunk in batch:
+        try:
+            out.append(get_embedding(chunk["text"]))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def _run_index_job(job_id, folder, files, all_chunks):
+    """Runs in a background thread: embeds all chunks, then stores them."""
+    try:
+        valid_chunks, embeddings, skipped = [], [], 0
+        total = len(all_chunks)
+        for i in range(0, total, EMBED_BATCH_SIZE):
+            batch = all_chunks[i : i + EMBED_BATCH_SIZE]
+            for chunk, vector in zip(batch, _embed_batch(batch)):
+                if vector is None:
+                    skipped += 1
+                else:
+                    valid_chunks.append(chunk)
+                    embeddings.append(vector)
+            _update_job(job_id, done=min(i + len(batch), total))
+
+        if not valid_chunks:
+            raise CoreError("No chunks could be processed. The files may be too large or unusual to embed.")
+
+        # Only now remove the old data for this folder, so a failed run never wipes a working index.
+        _update_job(job_id, phase="saving")
+        clear_folder(folder)
+        add_chunks(valid_chunks, embeddings, folder)
+        session_id = sessions.create_session(folder)
+
+        _finish_job(
+            job_id,
+            status="done",
+            phase="done",
+            result={
+                "session_id": session_id,
+                "folder": folder,
+                "files": len(files),
+                "chunks": len(valid_chunks),
+                "skipped": skipped,
+            },
+        )
+    except CoreError as e:
+        _finish_job(job_id, status="error", error=str(e))
+    except Exception as e:
+        _finish_job(job_id, status="error", error=f"Something went wrong while indexing: {e}")
+
+
+def start_index_job(folder):
+    """Checks the folder and reads its files right away (so mistakes fail fast with a clear
+    message), then embeds in the background. Returns a job id to poll with get_job."""
     folder = folder.strip().strip('"')
     if not folder:
         raise CoreError("Please enter a folder path first.")
@@ -66,29 +164,47 @@ def index_folder(folder):
     if not all_chunks:
         raise CoreError("Files were found, but no readable content was extracted from them.")
 
-    valid_chunks, embeddings, skipped = [], [], 0
-    for chunk in all_chunks:
-        try:
-            embeddings.append(get_embedding(chunk["text"]))
-            valid_chunks.append(chunk)
-        except Exception:
-            skipped += 1
-    if not valid_chunks:
-        raise CoreError("No chunks could be processed. The files may be too large or unusual to embed.")
+    job_id = uuid.uuid4().hex[:10]
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job["folder"] == folder and job["status"] == "running":
+                raise CoreError("That folder is already being indexed. Wait for it to finish.")
+        _JOBS[job_id] = {
+            "job_id": job_id,
+            "folder": folder,
+            "status": "running",       # running | done | error
+            "phase": "embedding",      # embedding | saving | done
+            "done": 0,
+            "total": len(all_chunks),
+            "files": len(files),
+            "result": None,
+            "error": None,
+            "seconds": None,
+            "started": time.time(),
+        }
+        _trim_jobs()
 
-    # Only now remove the old data for this folder, so a failed run never wipes a working index.
-    clear_folder(folder)
-    add_chunks(valid_chunks, embeddings, folder)
-    session_id = sessions.create_session(folder)
+    threading.Thread(
+        target=_run_index_job, args=(job_id, folder, files, all_chunks), daemon=True
+    ).start()
+    return {"job_id": job_id, "folder": folder, "files": len(files), "chunks": len(all_chunks)}
 
-    return {
-        "session_id": session_id,
-        "folder": folder,
-        "files": len(files),
-        "chunks": len(valid_chunks),
-        "skipped": skipped,
-    }
 
+def get_job(job_id):
+    """Progress of an indexing job, or None if the id is unknown (or the server restarted)."""
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        if not job:
+            return None
+        view = {k: v for k, v in job.items() if k != "started"}
+        if job["status"] == "running":
+            view["seconds"] = round(time.time() - job["started"], 1)
+    total = view["total"] or 1
+    view["percent"] = 100 if view["status"] == "done" else min(99, int(view["done"] * 100 / total))
+    return view
+
+
+# ---------------------------------------------------------------- chats and answers
 
 def start_session(folder):
     folder = os.path.normpath(folder.strip().strip('"'))

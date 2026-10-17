@@ -3,7 +3,6 @@ import re
 import time
 import uuid
 import difflib
-import shutil
 import threading
 import ollama
 
@@ -459,8 +458,9 @@ QUESTION: {effective_question}
 
 
 def reset_all():
-    shutil.rmtree("./chroma_db", ignore_errors=True)
-    if os.path.exists(sessions.SESSIONS_FILE):
-        os.remove(sessions.SESSIONS_FILE)
-    vectorstore.client = vectorstore.chromadb.PersistentClient(path="./chroma_db")
-    vectorstore.collection = vectorstore.client.get_or_create_collection(name="codebase")
+    """Deletes every index and every chat. Refuses while an indexing job is running."""
+    with _JOBS_LOCK:
+        if any(j["status"] == "running" for j in _JOBS.values()):
+            raise CoreError("Indexing is still running. Wait for it to finish, then reset.")
+    vectorstore.reset_index()
+    sessions.clear_all()

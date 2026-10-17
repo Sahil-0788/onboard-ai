@@ -1,7 +1,9 @@
 import os
 import chromadb
 
-client = chromadb.PersistentClient(path="./chroma_db")
+import paths
+
+client = chromadb.PersistentClient(path=paths.CHROMA_PATH)
 collection = client.get_or_create_collection(name="codebase")
 
 
@@ -36,6 +38,17 @@ def clear_folder(folder_path):
             ids_to_delete.append(existing["ids"][i])
     if ids_to_delete:
         collection.delete(ids=ids_to_delete)
+
+
+def reset_index():
+    """Deletes every indexed chunk by dropping and recreating the collection.
+    (Deleting the database files while ChromaDB has them open often fails on Windows.)"""
+    global collection
+    try:
+        client.delete_collection("codebase")
+    except Exception:
+        pass
+    collection = client.get_or_create_collection(name="codebase")
 
 
 def list_indexed_files(folder=None):

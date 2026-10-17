@@ -10,7 +10,9 @@ import sessions
 import vectorstore
 from chunker import find_code_files, chunk_file
 from embedder import get_embedding, get_embeddings
-from vectorstore import add_chunks, search, clear_folder, list_indexed_files, in_folder, get_file_chunks
+from vectorstore import (
+    add_chunks, search, clear_folder, delete_files, list_indexed_files, in_folder, get_file_chunks,
+)
 
 # The model that writes answers. Change this one line to switch models.
 ANSWER_MODEL = "qwen2.5-coder:3b"
@@ -57,6 +59,74 @@ def ollama_running():
     return ollama_status()["ollama_running"]
 
 
+# ---------------------------------------------------------------- change detection
+
+def _stamp(path):
+    """(modified time, size) of a file. Used to notice edits made after indexing."""
+    st = os.stat(path)
+    return (st.st_mtime, st.st_size)
+
+
+def _scan_changes(folder):
+    """Compares what was indexed with what is on disk now."""
+    result = {"changed": [], "added": [], "removed": [], "folder_missing": False}
+    if not os.path.isdir(folder):
+        result["folder_missing"] = True
+        return result
+
+    stored = vectorstore.file_stamps(folder)
+    on_disk = {}
+    for path in find_code_files(folder):
+        try:
+            on_disk[path] = _stamp(path)
+        except OSError:
+            continue
+
+    for path, stamp in stored.items():
+        if path not in on_disk:
+            result["removed"].append(path)
+        elif not _same_stamp(stamp, on_disk[path]):
+            result["changed"].append(path)
+
+    for path in on_disk:
+        if path not in stored:
+            try:
+                # An empty file never produces chunks, so it can never be "indexed". Ignore it.
+                if chunk_file(path):
+                    result["added"].append(path)
+            except OSError:
+                continue
+
+    for key in ("changed", "added", "removed"):
+        result[key].sort()
+    return result
+
+
+def _stale_summary(scan):
+    """Short description of what changed, or None if the index is up to date."""
+    if scan["folder_missing"]:
+        return {"folder_missing": True, "changed": 0, "added": 0, "removed": 0, "examples": []}
+    changed, added, removed = scan["changed"], scan["added"], scan["removed"]
+    if not (changed or added or removed):
+        return None
+    names = [os.path.basename(p) for p in changed + added + removed]
+    return {
+        "folder_missing": False,
+        "changed": len(changed),
+        "added": len(added),
+        "removed": len(removed),
+        "examples": names[:5],
+    }
+
+
+def get_status(session_id):
+    session = sessions.get_session(session_id)
+    if not session:
+        raise CoreError("That chat no longer exists.")
+    stale = _stale_summary(_scan_changes(session["folder"]))
+    return {"up_to_date": stale is None, "stale": stale}
+
+
 # ---------------------------------------------------------------- indexing jobs
 
 def _update_job(job_id, **fields):
@@ -83,6 +153,31 @@ def _trim_jobs():
         del _JOBS[jid]
 
 
+def _register_job(folder, kind, total, files):
+    """Creates a job record. Refuses if the same folder is already being worked on."""
+    job_id = uuid.uuid4().hex[:10]
+    with _JOBS_LOCK:
+        for job in _JOBS.values():
+            if job["folder"] == folder and job["status"] == "running":
+                raise CoreError("That folder is already being processed. Wait for it to finish.")
+        _JOBS[job_id] = {
+            "job_id": job_id,
+            "kind": kind,              # index | refresh
+            "folder": folder,
+            "status": "running",       # running | done | error
+            "phase": "embedding",      # embedding | saving | done
+            "done": 0,
+            "total": total,
+            "files": files,
+            "result": None,
+            "error": None,
+            "seconds": None,
+            "started": time.time(),
+        }
+        _trim_jobs()
+    return job_id
+
+
 def _embed_batch(batch):
     """Embeds a batch of chunks. If the batch call fails, retries one by one so a single
     bad chunk only skips itself. Returns a list the same length as batch (None = failed)."""
@@ -101,8 +196,9 @@ def _embed_batch(batch):
     return out
 
 
-def _run_index_job(job_id, folder, files, all_chunks):
-    """Runs in a background thread: embeds all chunks, then stores them."""
+def _run_job(job_id, folder, all_chunks, stamps, mode, info, remove_paths=None):
+    """Runs in a background thread. mode 'index' replaces the whole folder's index;
+    mode 'refresh' replaces only the files in remove_paths and adds the new chunks."""
     try:
         valid_chunks, embeddings, skipped = [], [], 0
         total = len(all_chunks)
@@ -116,27 +212,25 @@ def _run_index_job(job_id, folder, files, all_chunks):
                     embeddings.append(vector)
             _update_job(job_id, done=min(i + len(batch), total))
 
-        if not valid_chunks:
+        if mode == "index" and not valid_chunks:
             raise CoreError("No chunks could be processed. The files may be too large or unusual to embed.")
 
-        # Only now remove the old data for this folder, so a failed run never wipes a working index.
+        # Old data is removed only now, after the new embeddings exist, so a failed run
+        # never wipes a working index.
         _update_job(job_id, phase="saving")
-        clear_folder(folder)
-        add_chunks(valid_chunks, embeddings, folder)
-        session_id = sessions.create_session(folder)
+        if mode == "index":
+            clear_folder(folder)
+        else:
+            delete_files(folder, remove_paths or [])
+        if valid_chunks:
+            add_chunks(valid_chunks, embeddings, folder, stamps)
 
-        _finish_job(
-            job_id,
-            status="done",
-            phase="done",
-            result={
-                "session_id": session_id,
-                "folder": folder,
-                "files": len(files),
-                "chunks": len(valid_chunks),
-                "skipped": skipped,
-            },
-        )
+        result = dict(info)
+        if mode == "index":
+            result["session_id"] = sessions.create_session(folder)
+        result["chunks"] = len(valid_chunks)
+        result["skipped"] = skipped
+        _finish_job(job_id, status="done", phase="done", result=result)
     except CoreError as e:
         _finish_job(job_id, status="error", error=str(e))
     except Exception as e:
@@ -157,36 +251,68 @@ def start_index_job(folder):
     if not files:
         raise CoreError("No supported code files found in that folder.")
 
-    all_chunks = []
+    stamps, all_chunks = {}, []
     for file_path in files:
+        try:
+            stamps[file_path] = _stamp(file_path)   # taken BEFORE reading, so a later edit is noticed
+        except OSError:
+            continue
         all_chunks.extend(chunk_file(file_path))
     if not all_chunks:
         raise CoreError("Files were found, but no readable content was extracted from them.")
 
-    job_id = uuid.uuid4().hex[:10]
-    with _JOBS_LOCK:
-        for job in _JOBS.values():
-            if job["folder"] == folder and job["status"] == "running":
-                raise CoreError("That folder is already being indexed. Wait for it to finish.")
-        _JOBS[job_id] = {
-            "job_id": job_id,
-            "folder": folder,
-            "status": "running",       # running | done | error
-            "phase": "embedding",      # embedding | saving | done
-            "done": 0,
-            "total": len(all_chunks),
-            "files": len(files),
-            "result": None,
-            "error": None,
-            "seconds": None,
-            "started": time.time(),
-        }
-        _trim_jobs()
-
+    job_id = _register_job(folder, "index", len(all_chunks), len(files))
     threading.Thread(
-        target=_run_index_job, args=(job_id, folder, files, all_chunks), daemon=True
+        target=_run_job,
+        args=(job_id, folder, all_chunks, stamps, "index", {"folder": folder, "files": len(files)}),
+        daemon=True,
     ).start()
     return {"job_id": job_id, "folder": folder, "files": len(files), "chunks": len(all_chunks)}
+
+
+def start_refresh_job(session_id):
+    """Re-indexes only what changed since the folder was indexed. Keeps the same chat."""
+    session = sessions.get_session(session_id)
+    if not session:
+        raise CoreError("That chat no longer exists.")
+    folder = session["folder"]
+
+    scan = _scan_changes(folder)
+    if scan["folder_missing"]:
+        raise CoreError("The folder no longer exists on this computer, so it can't be refreshed.")
+    changed, added, removed = scan["changed"], scan["added"], scan["removed"]
+    if not (changed or added or removed):
+        raise CoreError("Nothing has changed since this folder was indexed.")
+
+    stamps, new_chunks = {}, []
+    for path in changed + added:
+        try:
+            stamps[path] = _stamp(path)
+        except OSError:
+            continue
+        new_chunks.extend(chunk_file(path))
+
+    info = {
+        "session_id": session_id,
+        "folder": folder,
+        "changed": len(changed),
+        "added": len(added),
+        "removed": len(removed),
+    }
+    job_id = _register_job(folder, "refresh", len(new_chunks), len(changed) + len(added) + len(removed))
+    threading.Thread(
+        target=_run_job,
+        args=(job_id, folder, new_chunks, stamps, "refresh", info, changed + removed),
+        daemon=True,
+    ).start()
+    return {
+        "job_id": job_id,
+        "folder": folder,
+        "changed": len(changed),
+        "added": len(added),
+        "removed": len(removed),
+        "chunks": len(new_chunks),
+    }
 
 
 def get_job(job_id):
@@ -331,6 +457,13 @@ def answer_question(session_id, question, model=None):
     files = _folder_files(folder)
     if not files:
         raise CoreError("This folder needs to be indexed again before you can ask about it.")
+
+    # Tell the caller if the code changed since indexing (the answer still uses the old index).
+    try:
+        stale = _stale_summary(_scan_changes(folder))
+    except Exception:
+        stale = None
+
     candidates = _candidates(folder, files)
     effective_question, corrected = _correct_typos(question, candidates)
 
@@ -454,6 +587,7 @@ QUESTION: {effective_question}
         "answer": answer,
         "interpreted_as": effective_question if corrected else None,
         "sources": sources,
+        "stale": stale,
     }
 
 
@@ -464,3 +598,13 @@ def reset_all():
             raise CoreError("Indexing is still running. Wait for it to finish, then reset.")
     vectorstore.reset_index()
     sessions.clear_all()
+
+def _same_stamp(stored, on_disk):
+    """True if a stored (mtime, size) matches the file on disk. Times are compared with a
+    tolerance of 1 ms because the stored float can differ in its last digits after
+    going through the database (an exact == flagged untouched files as changed)."""
+    s_time, s_size = stored
+    d_time, d_size = on_disk
+    if s_time is None or s_size is None:
+        return False   # indexed before stamps existed
+    return s_size == d_size and abs(s_time - d_time) < 0.001

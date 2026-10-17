@@ -67,6 +67,27 @@ def new_session(req: FolderRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.get("/sessions/{session_id}/status")
+def session_status(session_id: str):
+    """Has the code changed since this chat's folder was indexed?"""
+    try:
+        return core.get_status(session_id)
+    except core.CoreError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/sessions/{session_id}/refresh")
+def refresh(session_id: str):
+    """Re-indexes only the changed, new and deleted files. Poll GET /index/{job_id}."""
+    _require_ollama()
+    try:
+        return core.start_refresh_job(session_id)
+    except core.CoreError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Something went wrong while refreshing: {e}")
+
+
 @app.post("/index")
 def index(req: FolderRequest):
     """Starts indexing in the background and returns a job_id. Poll GET /index/{job_id}."""
@@ -85,7 +106,7 @@ def index_status(job_id: str):
     if not job:
         raise HTTPException(
             status_code=404,
-            detail="Unknown indexing job. It may have finished long ago or the server was restarted.",
+            detail="Unknown job. It may have finished long ago or the server was restarted.",
         )
     return job
 
@@ -106,5 +127,7 @@ def reset():
     try:
         core.reset_all()
         return {"ok": True}
+    except core.CoreError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Couldn't reset: {e}")

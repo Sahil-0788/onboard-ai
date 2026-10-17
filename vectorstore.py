@@ -6,6 +6,8 @@ import paths
 client = chromadb.PersistentClient(path=paths.CHROMA_PATH)
 collection = client.get_or_create_collection(name="codebase")
 
+SAVE_BATCH_SIZE = 1000   # ChromaDB rejects very large single inserts, so save in slices
+
 
 def in_folder(file_path, folder):
     """True if file_path is the folder itself or sits inside it (not just a name prefix)."""
@@ -13,21 +15,34 @@ def in_folder(file_path, folder):
     return file_path == folder or file_path.startswith(folder + os.sep)
 
 
-def add_chunks(chunks, embeddings, folder):
-    """Stores chunks, tagging each with the root folder that was indexed.
+def add_chunks(chunks, embeddings, folder, stamps=None):
+    """Stores chunks, tagging each with the root folder and (if given) the file's
+    modified time and size, so changes can be detected later.
     Uses upsert so re-indexing the same files replaces them instead of failing."""
     ids, documents, metadatas = [], [], []
     for chunk in chunks:
         unique_id = f"{chunk['file']}::{chunk['start_line']}-{chunk['end_line']}"
-        ids.append(unique_id)
-        documents.append(chunk["text"])
-        metadatas.append({
+        meta = {
             "file": chunk["file"],
             "start_line": chunk["start_line"],
             "end_line": chunk["end_line"],
             "folder": folder,
-        })
-    collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+        }
+        stamp = (stamps or {}).get(chunk["file"])
+        if stamp:
+            meta["mtime"], meta["size"] = stamp
+        ids.append(unique_id)
+        documents.append(chunk["text"])
+        metadatas.append(meta)
+
+    for i in range(0, len(ids), SAVE_BATCH_SIZE):
+        j = i + SAVE_BATCH_SIZE
+        collection.upsert(
+            ids=ids[i:j],
+            embeddings=embeddings[i:j],
+            documents=documents[i:j],
+            metadatas=metadatas[i:j],
+        )
 
 
 def clear_folder(folder_path):
@@ -38,6 +53,30 @@ def clear_folder(folder_path):
             ids_to_delete.append(existing["ids"][i])
     if ids_to_delete:
         collection.delete(ids=ids_to_delete)
+
+
+def delete_files(folder, file_paths):
+    """Removes every chunk belonging to the given files (within one indexed folder)."""
+    targets = set(file_paths)
+    if not targets:
+        return
+    existing = collection.get(where={"folder": folder}, include=["metadatas"])
+    ids = [cid for cid, m in zip(existing["ids"], existing["metadatas"]) if m["file"] in targets]
+    if ids:
+        collection.delete(ids=ids)
+
+
+def file_stamps(folder):
+    """{file path: (mtime, size)} as recorded when the folder was indexed.
+    Files indexed before stamps existed come back as (None, None)."""
+    try:
+        existing = collection.get(where={"folder": folder}, include=["metadatas"])
+    except Exception:
+        return {}
+    stamps = {}
+    for m in existing["metadatas"]:
+        stamps[m["file"]] = (m.get("mtime"), m.get("size"))
+    return stamps
 
 
 def reset_index():
